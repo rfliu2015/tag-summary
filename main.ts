@@ -1,6 +1,6 @@
 
 import { Console } from 'console';
-import { Editor, Plugin, MarkdownRenderer, getAllTags, TFile } from 'obsidian';
+import { Editor, Plugin, MarkdownRenderer, getAllTags, TFile, TagCache, CachedMetadata } from 'obsidian';
 import { SummarySettingTab } from "./settings";
 import { SummaryModal } from "./summarytags";
 
@@ -9,17 +9,19 @@ interface SummarySettings {
 	includelink: boolean;
 	removetags: boolean;
 	listparagraph: boolean;
- 	includechildren: boolean;
+	includechildren: boolean;
 }
 const DEFAULT_SETTINGS: Partial<SummarySettings> = {
 	includecallout: true,
 	includelink: true,
 	removetags: false,
 	listparagraph: true,
- 	includechildren: true,
+	includechildren: true,
 };
+type FileInfo = [TFile, string, CachedMetadata];
 export default class SummaryPlugin extends Plugin {
 	settings: SummarySettings;
+	regex = /\^([^^]+?)\n/;
 
 	async onload() {
 		// Prepare Settings
@@ -111,7 +113,7 @@ export default class SummaryPlugin extends Plugin {
 			} else {
 				this.createEmptySummary(el);
 			}
-		});  
+		});
 	}
 
 	// Show empty summary when the tags are not found
@@ -119,9 +121,18 @@ export default class SummaryPlugin extends Plugin {
 		const container = createEl("div");
 		container.createEl("span", {
 			attr: { style: 'color: var(--text-error) !important;' },
-			text: "There are no blocks that match the specified tags." 
+			text: "There are no blocks that match the specified tags."
 		});
 		element.replaceWith(container);
+	}
+
+	includeTag(validTag: string, tagsInFile: TagCache[]) {
+		for (let tagF of tagsInFile) {
+			if (tagF.tag.startsWith(validTag)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// Load the blocks and create the summary
@@ -135,13 +146,16 @@ export default class SummaryPlugin extends Plugin {
 		listFiles = listFiles.filter((file) => {
 			// Remove files that do not contain the tags selected by the user
 			const cache = app.metadataCache.getFileCache(file);
-			const tagsInFile = getAllTags(cache);
+			const { tags, frontmatter } = cache;
+			if ((frontmatter && frontmatter["exclude-tag-summary"] == "true") || !tags) {
+				return false;
+			}
 
-			if (validTags.some((value) => tagsInFile.includes(value))) {
+			if (validTags.some((value) => this.includeTag(value, tags))) {
 				return true;
 			}
 			return false;
-        });
+		});
 
 		// Sort files alphabetically
 		listFiles = listFiles.sort((file1, file2) => {
@@ -155,121 +169,76 @@ export default class SummaryPlugin extends Plugin {
 		});
 
 		// Get files content
-		let listContents: [TFile, string][] = await this.readFiles(listFiles);
+		let listContents: FileInfo[] = await this.readFiles(listFiles);
 
 		// Create summary ttt
 		let summary: string = "";
+
+		let totalLines: [string, string][] = [];
 		listContents.forEach((item) => {
 			// Get files name
-			const fileName = item[0].name.replace(/.md$/g, "");
-			const filePath = item[0].path;
+			const tfile = item[0], content = item[1].split("\n"), cache = item[2];
+			const fileName = tfile.name.replace(/.md$/g, ""), filePath = tfile.path;
 
 			// Get paragraphs
-			let listParagraphs: string[] = Array();
-			const blocks = item[1].split(/\n\s*\n/).filter((row) => row.trim().length > 0);
+			let listLines: [string, string][] = Array();
+			// const blocks = item[1].split(/\n\s*\n/).filter((row) => row.trim().length > 0);
+			const tagsInFile = cache.tags;
 
-			// Get list items
-			blocks.forEach((paragraph) => {
-				// Check if the paragraph is another plugin
-				let valid = false;
-				let listTags = paragraph.match(/#[\p{L}0-9_\-/#]+/gu);
-
-				if (listTags != null && listTags.length > 0) {
-					if (!paragraph.contains("```")) {
-						valid = this.isValidText(listTags, tags, include, exclude);
+			// 遍历所有 tags, 匹配目标 tag
+			tagsInFile.forEach(tagF => {
+				for (const vtag of validTags) {
+					if (tagF.tag.startsWith(vtag)) {
+						// 取出文本
+						const startLine = tagF.position.start.line, endline = tagF.position.end.line;
+						let targetLine = content[startLine];
+						listLines.push([targetLine, tagF.tag]);
 					}
 				}
-				if (valid) {
-					if (!this.settings.listparagraph) {
-						// Add all paragraphs
-						listParagraphs.push(paragraph);
-					} else {
-						// Add paragraphs and the items of a list
-						let listItems: string[] = Array();
-						let itemText = "";
-
-						paragraph.split('\n\s*\n').forEach((line) => {
-							let isList = false;
-							isList = line.search(/(\s*[\-\+\*]){1}|([0-9]\.){1}\s+/) != -1
-	
-							if (!isList) {
-								// Add normal paragraphs
-								listParagraphs.push(line);
-								itemText = "";
-							} else {
-								line.split('\n').forEach((itemLine) => {
-									// Get the item's level
-									let level = 0;
-									const endIndex = itemLine.search(/[\-\+\*]{1}|([0-9]\.){1}\s+/);
-									const tabText = itemLine.slice(0, endIndex);
-									const tabs = tabText.match(/\t/g);
-									if (tabs) {
-										level = tabs.length;
-									}
-									// Get items tree
-									if (level == 0) {
-										if (itemText != "") {
-											listItems.push(itemText);
-											itemText = "";
-										}
-										itemText = itemText.concat(itemLine + "\n");
-									} else if (this.settings.includechildren && level > 0 && itemText != "") {
-										itemText = itemText.concat(itemLine + "\n");
-									}
-								});
-							}
-						});
-						if (itemText != "") {
-							listItems.push(itemText);
-							itemText = "";
-						}
-
-						// Check tags on the items
-						listItems.forEach((line) => {
-							listTags = line.match(/#[\p{L}0-9_\-/#]+/gu);
-							if (listTags != null && listTags.length > 0) {
-								if (this.isValidText(listTags, tags, include, exclude)) {
-									listParagraphs.push(line);
-								}
-							}
-						});
- 					}
-				}
-			})
-
-			// Process each block of text
-			listParagraphs.forEach((paragraph) => {
-				// Restore newline at the end
-				paragraph += "\n";
-				
-				// Remove tags from blocks
-				if (this.settings.removetags) {
-					paragraph = paragraph.replace(/#[\p{L}0-9_\-/#]+/gu, "");
-				}
-
-				// Add link to original note
-				if (this.settings.includelink) {
-					paragraph = "**Source:** [[" + filePath + "|" + fileName + "]]\n" + paragraph;
-				}
-
-				// Insert the text in a callout
-				if (this.settings.includecallout) {
-					// Insert the text in a callout box
-					let callout = "> [!" + fileName + "]\n";
-					const rows = paragraph.split("\n");
-					rows.forEach((row) => {
-						callout += "> " + row + "\n";
-					});
-					paragraph = callout + "\n\n";
-				} else {
-					// No Callout
-					paragraph += "\n\n";
-				}
-
-				// Add to Summary
-				summary += paragraph;
 			});
+
+			listLines
+				.forEach(([line, tagName], index) => {
+					// Restore newline at the end
+					line += "\n";
+
+					if (this.settings.includelink) {
+						let result,
+							src = tfile.path,
+							alias = fileName;
+						if ((result = line.match(this.regex))) {
+							let link = result[1].trim();
+							src = `${src}#^${link}`;
+							alias = `${alias}=>${link}`;
+						}
+						if ((result = line.match(/\*\*([^*]+?)\*\*/))) {
+							alias = result[1].trim();
+						}
+						line = line + "\n" + `Source: **[[${src}|${alias}]]**\n`;
+					}
+
+					// Insert the text in a callout
+					if (this.settings.includecallout) {
+						let callout = '> [!' + fileName + ']\n';
+						const rows = line.split('\n');
+						rows.forEach(row => {
+							callout += '> ' + row + '\n';
+						});
+						line = callout + '\n\n';
+					} else {
+						line += '\n\n';
+					}
+
+					listLines[index][0] = line;
+					totalLines.push([line, tagName]);
+				});
 		});
+
+		totalLines
+			.sort((a, b) => a[1].localeCompare(b[1]))
+			.forEach(([line, tagName]) => {
+				summary += line;
+			});
 
 		// Add Summary
 		if (summary != "") {
@@ -282,33 +251,34 @@ export default class SummaryPlugin extends Plugin {
 	}
 
 	// Read Files
-	async readFiles(listFiles: TFile[]): Promise<[TFile, string][]> {
-		let list: [TFile, string][] = [];
+	async readFiles(listFiles: TFile[]): Promise<FileInfo[]> {
+		let list: FileInfo[] = [];
 		for (let t = 0; t < listFiles.length; t += 1) {
 			const file = listFiles[t];
 			let content = await this.app.vault.cachedRead(file);
-			list.push([file, content]);
+			let cache = this.app.metadataCache.getCache(file.path);
+			list.push([file, content, cache]);
 		}
 		return list;
 	}
 
 	// Check if tags are valid
-	isValidText(listTags: string[], tags: string[], include: string[], exclude: string[]): boolean {
+	isValidText(listTags: TagCache[], tags: string[], include: string[], exclude: string[]): boolean {
 		let valid = true;
 
 		// Check OR (tags)
 		if (tags.length > 0) {
-			valid = valid && tags.some((value) => listTags.includes(value));
+			valid = valid && tags.some((value) => this.includeTag(value, listTags));
 		}
 		// Check AND (include)
 		if (include.length > 0) {
-			valid = valid && include.every((value) => listTags.includes(value));
+			valid = valid && include.every((value) => this.includeTag(value, listTags));
 		}
 		// Check NOT (exclude)
 		if (valid && exclude.length > 0) {
-			valid = !exclude.some((value) => listTags.includes(value));
+			valid = !exclude.some((value) => this.includeTag(value, listTags));
 		}
-		return valid;		
+		return valid;
 	}
 
 	// Settings
@@ -317,6 +287,6 @@ export default class SummaryPlugin extends Plugin {
 	}
 	async saveSettings() {
 		await this.saveData(this.settings);
-	}	
+	}
 }
 
